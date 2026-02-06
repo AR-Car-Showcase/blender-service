@@ -22,7 +22,7 @@ BASE_MODELS_DIR = os.path.join(BASE_DIR, "base_models")
 GENERATED_DIR = os.path.join(BASE_DIR, "generated")
 OUTPUT_DIR = GENERATED_DIR
 
-CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, "car.glb")
+CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, "carV2.glb")
 
 os.makedirs(BASE_MODELS_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
