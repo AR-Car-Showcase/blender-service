@@ -18,11 +18,13 @@ BLENDER_PATH = shutil.which("blender") or "blender"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-BASE_MODELS_DIR = os.path.join(BASE_DIR, "base_models")
+# Point to Spring Boot resources directory relative to this script
+BASE_MODELS_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "src", "main", "resources", "static", "models"))
 GENERATED_DIR = os.path.join(BASE_DIR, "generated")
 OUTPUT_DIR = GENERATED_DIR
 
-CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, "carV2.glb")
+# Default fallback model
+CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, "car.glb")
 
 os.makedirs(BASE_MODELS_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -75,9 +77,23 @@ def generate():
             output_filename = f"car_{model_id}.glb"
         
         output_path = os.path.join(OUTPUT_DIR, output_filename)
+        base_model_input = config.get("base_model", "car.glb")
+        
+        if "/" in base_model_input:
+            base_model_name = base_model_input.split("/")[-1]
+        else:
+            base_model_name = base_model_input
+            
+        base_model_path = os.path.join(BASE_MODELS_DIR, base_model_name)
+             
+        if not os.path.exists(base_model_path):
+             return jsonify({
+                 "error": f"Base model file not found in resources: {base_model_name}",
+                 "details": base_model_path
+             }), 404
 
         blender_config = {
-            "base_model": CAR_MODEL_PATH,
+            "base_model": base_model_path,
             "output_path": output_path,
             "materials": config.get("materials", {})
         }
@@ -119,7 +135,6 @@ def generate():
                 "stderr": result.stderr
             }), 500
 
-        # wait for filesystem flush
         for _ in range(30):
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 break
