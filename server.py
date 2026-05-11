@@ -18,13 +18,17 @@ BLENDER_PATH = shutil.which("blender") or "blender"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Point to Spring Boot resources directory relative to this script
-BASE_MODELS_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "src", "main", "resources", "static", "models"))
-GENERATED_DIR = os.path.join(BASE_DIR, "generated")
+# Prefer explicit mount path from environment (docker-compose), then fallback.
+BASE_MODELS_DIR = os.environ.get(
+    "BASE_MODELS_DIR",
+    os.path.abspath(os.path.join(BASE_DIR, "src", "main", "resources", "static", "models"))
+)
+GENERATED_DIR = os.environ.get("GENERATED_DIR", os.path.join(BASE_DIR, "generated"))
 OUTPUT_DIR = GENERATED_DIR
 
 # Default fallback model
-CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, "car.glb")
+CAR_MODEL_NAME = os.environ.get("CAR_MODEL_NAME", "car.glb")
+CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, CAR_MODEL_NAME)
 
 os.makedirs(BASE_MODELS_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -61,12 +65,6 @@ def generate():
         if not config:
             return jsonify({"error": "No config provided"}), 400
 
-        if not os.path.exists(CAR_MODEL_PATH):
-            return jsonify({
-                "error": "Base model missing",
-                "details": CAR_MODEL_PATH
-            }), 500
-
         if "output_name" in config:
             output_filename = config["output_name"]
             if not output_filename.endswith(".glb"):
@@ -77,7 +75,7 @@ def generate():
             output_filename = f"car_{model_id}.glb"
         
         output_path = os.path.join(OUTPUT_DIR, output_filename)
-        base_model_input = config.get("base_model", "car.glb")
+        base_model_input = config.get("base_model", CAR_MODEL_NAME)
         
         if "/" in base_model_input:
             base_model_name = base_model_input.split("/")[-1]

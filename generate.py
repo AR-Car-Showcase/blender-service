@@ -66,12 +66,18 @@ def main():
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    bpy.ops.export_scene.gltf(
+    # Blender 2.83 can silently cancel export for some arg combinations.
+    # Use a compatibility-safe call and validate output explicitly.
+    result = bpy.ops.export_scene.gltf(
         filepath=output_path,
         export_format="GLB",
-        export_apply=True,
         export_materials="EXPORT"
     )
+    print(f"[INFO] Export result: {result}")
+    print(f"[INFO] Export target: {output_path}")
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"GLB export failed, file missing/empty at: {output_path}")
 
 # --------------------------------------------------
 
