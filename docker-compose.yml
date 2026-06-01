@@ -1,0 +1,12 @@
+services:
+  blender:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - GENERATED_DIR=/shared/generated
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    volumes:
+      - ${OCI_CONFIG_DIR:-/tmp/oci-empty}:/root/.oci:ro
