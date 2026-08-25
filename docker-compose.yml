@@ -6,7 +6,9 @@ services:
     environment:
       - GENERATED_DIR=/shared/generated
     ports:
-      - "5000:5000"
+      # Bind to an explicit interface, never 0.0.0.0. Set BLENDER_BIND_ADDRESS to the
+      # VM's PRIVATE VCN address so the render API is not reachable from the internet.
+      - "${BLENDER_BIND_ADDRESS:-127.0.0.1}:5000:5000"
     restart: unless-stopped
     volumes:
-      - ${OCI_CONFIG_DIR:-/tmp/oci-empty}:/root/.oci:ro
+      - ${OCI_CONFIG_DIR:-/tmp/oci-empty}:/home/blender/.oci:ro

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+import functools
+import hmac
+import re
 import subprocess
 import json
 import os
@@ -10,7 +12,6 @@ import time
 import shutil
 import tempfile
 import urllib.parse
-import urllib.request
 from contextlib import suppress
 
 try:
@@ -19,7 +20,6 @@ except ImportError:
     oci = None
 
 app = Flask(__name__)
-CORS(app)
 
 BLENDER_PATH = shutil.which("blender") or "blender"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +32,12 @@ GENERATED_DIR = os.environ.get("GENERATED_DIR", os.path.join(BASE_DIR, "generate
 OUTPUT_DIR = GENERATED_DIR
 TEMP_DIR = os.environ.get("TEMP_DIR", os.path.join(tempfile.gettempdir(), "arcs-blender"))
 GENERATE_TIMEOUT_SECONDS = int(os.environ.get("GENERATE_TIMEOUT_SECONDS", "120"))
-HTTP_DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("HTTP_DOWNLOAD_TIMEOUT_SECONDS", "60"))
+
+# Shared secret required on every non-health request. The service used to trust the
+# network completely, which is only safe if the network is actually private - it was
+# not. Fail closed at startup rather than silently accepting anonymous render jobs.
+BLENDER_SERVICE_TOKEN = os.environ.get("BLENDER_SERVICE_TOKEN", "").strip()
+MIN_TOKEN_LENGTH = 32
 
 CAR_MODEL_NAME = os.environ.get("CAR_MODEL_NAME", "car.glb")
 CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, CAR_MODEL_NAME)
@@ -49,6 +54,20 @@ OCI_CLEANUP_LOCAL_FILES = os.environ.get("OCI_CLEANUP_LOCAL_FILES", "true").lowe
 
 _oci_client = None
 _oci_namespace_cache = None
+
+if len(BLENDER_SERVICE_TOKEN) < MIN_TOKEN_LENGTH:
+    raise SystemExit(
+        "BLENDER_SERVICE_TOKEN is missing or shorter than {} characters.\n"
+        "This service performs unauthenticated-by-default work (spawning Blender, reading\n"
+        "object storage) and must not run without a shared secret.\n"
+        "Generate one with:  openssl rand -hex 32\n"
+        "then set it identically here and on the Spring backend.".format(MIN_TOKEN_LENGTH)
+    )
+
+# Object names and output names are attacker-influenced. Keep them to a strict charset
+# so nothing can escape a directory or a bucket prefix.
+SAFE_OUTPUT_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SAFE_OBJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9/._-]{0,255}$")
 
 os.makedirs(BASE_MODELS_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -116,20 +135,74 @@ def _build_oci_object_url(object_name: str, namespace_name: str) -> str:
     return f"{_get_public_base_url(namespace_name)}/{encoded_object_name}"
 
 
+def _allowed_object_hosts() -> set:
+    hosts = {"objectstorage.{}.oraclecloud.com".format(OCI_REGION)}
+    if OCI_PUBLIC_BASE_URL:
+        custom = urllib.parse.urlparse(OCI_PUBLIC_BASE_URL).netloc
+        if custom:
+            hosts.add(custom)
+    return hosts
+
+
+def _validate_object_name(object_name: str) -> str:
+    """Reject anything that is not a plain .glb key under a configured prefix.
+
+    This is the SSRF/traversal chokepoint: every path that ends in an object read
+    goes through here, so a caller cannot walk out of the bucket prefix or point us
+    at an arbitrary key.
+    """
+    candidate = (object_name or "").strip().lstrip("/")
+
+    if not candidate or not SAFE_OBJECT_NAME.match(candidate):
+        raise ValueError("Base model reference contains illegal characters.")
+
+    if ".." in candidate.split("/") or "\\" in candidate:
+        raise ValueError("Base model reference must not traverse directories.")
+
+    if not candidate.lower().endswith(".glb"):
+        raise ValueError("Base model must be a .glb object.")
+
+    allowed_prefixes = tuple(p for p in (OCI_MODELS_PREFIX, OCI_GENERATED_PREFIX) if p)
+    if allowed_prefixes and not candidate.startswith(allowed_prefixes):
+        raise ValueError("Base model must live under an allowed bucket prefix.")
+
+    return candidate
+
+
 def _extract_object_name_from_oci_url(url: str):
+    """Map a trusted object-storage URL back to its object key.
+
+    Returns None when the URL is not one of ours - callers must then reject the
+    request rather than falling back to fetching it directly.
+    """
     if not _is_http_url(url):
         return None
+
     parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https":
+        return None
+    if parsed.netloc not in _allowed_object_hosts():
+        return None
+
     decoded_path = urllib.parse.unquote(parsed.path)
     marker = "/o/"
     if marker not in decoded_path:
         return None
-    return decoded_path.split(marker, 1)[1]
 
+    prefix, object_name = decoded_path.split(marker, 1)
 
-def _download_from_url(source_url: str, output_path: str):
-    with urllib.request.urlopen(source_url, timeout=HTTP_DOWNLOAD_TIMEOUT_SECONDS) as response, open(output_path, "wb") as local_file:
-        shutil.copyfileobj(response, local_file)
+    # When the canonical objectstorage host is used the path carries /n/<ns>/b/<bucket>;
+    # make sure the request is not pointed at somebody else's bucket.
+    if "/b/" in prefix:
+        bucket_segment = prefix.split("/b/", 1)[1].split("/", 1)[0]
+        if bucket_segment != OCI_BUCKET_NAME:
+            return None
+    if "/n/" in prefix and OCI_NAMESPACE:
+        namespace_segment = prefix.split("/n/", 1)[1].split("/", 1)[0]
+        if namespace_segment != OCI_NAMESPACE:
+            return None
+
+    return object_name
 
 
 def _download_from_oci_object(object_name: str, output_path: str):
@@ -141,36 +214,94 @@ def _download_from_oci_object(object_name: str, output_path: str):
 
 
 def _resolve_base_model_to_local_file(base_model_input: str, model_id: str) -> str:
+    """Resolve a caller-supplied base model reference to a local file.
+
+    Only two forms are accepted, and both end in an authenticated OCI SDK read of a
+    validated object key:
+
+      1. a bare object key or filename (``hyundai-aura.glb`` / ``models/hyundai-aura.glb``)
+      2. an https URL on our own object-storage host for our own bucket
+
+    Arbitrary URLs are NOT fetched. The previous implementation passed any http(s)
+    string to urllib, which let a caller reach internal addresses - including the
+    instance metadata endpoint that issues this VM's OCI credentials.
+    """
     model_candidate = (base_model_input or "").strip()
     if not model_candidate:
         model_candidate = CAR_MODEL_NAME
 
-    temp_base_model_path = os.path.join(TEMP_DIR, f"base_{model_id}.glb")
-
     if _is_http_url(model_candidate):
         object_name = _extract_object_name_from_oci_url(model_candidate)
-        if OCI_OBJECT_STORAGE_ENABLED and object_name:
-            _download_from_oci_object(object_name, temp_base_model_path)
-        else:
-            _download_from_url(model_candidate, temp_base_model_path)
-        return temp_base_model_path
-
-    if os.path.isabs(model_candidate) and os.path.exists(model_candidate):
-        return model_candidate
-
-    local_filename = os.path.basename(model_candidate)
-    local_path = os.path.join(BASE_MODELS_DIR, local_filename)
-    if os.path.exists(local_path):
-        return local_path
-
-    if OCI_OBJECT_STORAGE_ENABLED:
-        object_name = model_candidate
-        if "/" not in object_name:
-            object_name = f"{OCI_MODELS_PREFIX}{object_name}"
+        if not object_name:
+            raise ValueError(
+                "Base model URL is not an allowed object-storage location."
+            )
+        object_name = _validate_object_name(object_name)
+        temp_base_model_path = os.path.join(TEMP_DIR, "base_{}.glb".format(model_id))
         _download_from_oci_object(object_name, temp_base_model_path)
         return temp_base_model_path
 
-    raise FileNotFoundError(f"Base model not found: {model_candidate}")
+    # Non-URL input: treat as a bucket key, but serve from the local mirror when present.
+    local_filename = os.path.basename(model_candidate)
+    if not SAFE_OBJECT_NAME.match(local_filename) or not local_filename.lower().endswith(".glb"):
+        raise ValueError("Base model reference is not a valid .glb name.")
+
+    local_path = os.path.realpath(os.path.join(BASE_MODELS_DIR, local_filename))
+    if local_path.startswith(os.path.realpath(BASE_MODELS_DIR) + os.sep) and os.path.exists(local_path):
+        return local_path
+
+    if not OCI_OBJECT_STORAGE_ENABLED:
+        raise FileNotFoundError("Base model not found: {}".format(local_filename))
+
+    object_name = model_candidate.lstrip("/")
+    if "/" not in object_name:
+        object_name = "{}{}".format(OCI_MODELS_PREFIX, object_name)
+    object_name = _validate_object_name(object_name)
+
+    temp_base_model_path = os.path.join(TEMP_DIR, "base_{}.glb".format(model_id))
+    _download_from_oci_object(object_name, temp_base_model_path)
+    return temp_base_model_path
+
+
+def _resolve_output_path(output_name: str):
+    """Turn a caller-supplied output name into a safe filename inside OUTPUT_DIR.
+
+    ``output_name`` used to be concatenated straight into a path, so a value like
+    ``../../etc/cron.d/x`` wrote outside the output directory - as root.
+    """
+    raw = (output_name or "").strip()
+    if raw.lower().endswith(".glb"):
+        raw = raw[:-4]
+
+    # Validate the value as supplied. Deliberately NOT basename() first: silently
+    # rewriting "../../etc/cron.d/x" into "x" would hide the attack and let two
+    # different requested names collide onto one output file.
+    if not SAFE_OUTPUT_NAME.match(raw) or raw != os.path.basename(raw):
+        raise ValueError(
+            "output_name must be 1-64 characters of letters, digits, underscore or hyphen."
+        )
+
+    output_filename = raw + ".glb"
+    output_path = os.path.realpath(os.path.join(OUTPUT_DIR, output_filename))
+
+    # Belt and braces: the regex already forbids separators, but assert containment.
+    if not output_path.startswith(os.path.realpath(OUTPUT_DIR) + os.sep):
+        raise ValueError("Resolved output path escapes the output directory.")
+
+    return raw, output_filename, output_path
+
+
+def require_service_token(view):
+    """Reject any request that does not present the shared secret."""
+
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        presented = request.headers.get("X-Blender-Token", "")
+        if not hmac.compare_digest(presented, BLENDER_SERVICE_TOKEN):
+            return jsonify({"error": "Unauthorized"}), 401
+        return view(*args, **kwargs)
+
+    return wrapper
 
 
 def _upload_generated_model(local_output_path: str, output_filename: str):
@@ -194,13 +325,25 @@ def _upload_generated_model(local_output_path: str, output_filename: str):
 
 @app.route("/health", methods=["GET"])
 def health():
+    """Unauthenticated liveness probe.
+
+    Deliberately minimal: it neither shells out to Blender (which would let anyone
+    spawn processes) nor echoes bucket, namespace or path configuration.
+    """
+    return jsonify({"status": "ok", "service": "blender-generation"})
+
+
+@app.route("/health/details", methods=["GET"])
+@require_service_token
+def health_details():
     try:
-        result = subprocess.run([BLENDER_PATH, "--version"], capture_output=True, text=True)
+        result = subprocess.run(
+            [BLENDER_PATH, "--version"], capture_output=True, text=True, timeout=15
+        )
         blender_version = result.stdout.split("\n")[0]
     except Exception as e:
         blender_version = f"Error: {e}"
 
-    namespace_value = OCI_NAMESPACE or "(auto-resolved)"
     oci_status = "disabled"
     if OCI_OBJECT_STORAGE_ENABLED:
         oci_status = "enabled" if oci is not None else "missing-sdk"
@@ -209,13 +352,8 @@ def health():
         "status": "ok",
         "blender_path": BLENDER_PATH,
         "blender_version": blender_version,
-        "oci_enabled": OCI_OBJECT_STORAGE_ENABLED,
-        "bucket": OCI_BUCKET_NAME,
-        "namespace": namespace_value,
-        "auth_mode": OCI_AUTH_MODE,
         "oci_object_storage": oci_status,
         "oci_region": OCI_REGION,
-        "oci_namespace": namespace_value,
         "oci_bucket": OCI_BUCKET_NAME,
         "oci_models_prefix": OCI_MODELS_PREFIX,
         "oci_generated_prefix": OCI_GENERATED_PREFIX,
@@ -225,6 +363,7 @@ def health():
 
 
 @app.route("/generate", methods=["POST"])
+@require_service_token
 def generate():
     temp_files = []
     output_path = None
@@ -235,18 +374,17 @@ def generate():
         if not config:
             return jsonify({"error": "No config provided"}), 400
 
-        if "output_name" in config:
-            output_filename = config["output_name"]
-            if not output_filename.endswith(".glb"):
-                output_filename += ".glb"
-            model_id = output_filename.replace("car_", "").replace(".glb", "")
-        else:
-            model_id = str(uuid.uuid4())[:8]
-            output_filename = f"car_{model_id}.glb"
+        requested_name = config.get("output_name") or f"car_{str(uuid.uuid4())[:8]}"
+        try:
+            model_id, output_filename, output_path = _resolve_output_path(requested_name)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
         base_model_input = config.get("base_model", CAR_MODEL_NAME)
-        base_model_path = _resolve_base_model_to_local_file(base_model_input, model_id)
+        try:
+            base_model_path = _resolve_base_model_to_local_file(base_model_input, model_id)
+        except (ValueError, FileNotFoundError) as e:
+            return jsonify({"error": str(e)}), 400
         if base_model_path.startswith(TEMP_DIR):
             temp_files.append(base_model_path)
 
@@ -276,13 +414,10 @@ def generate():
         elapsed = time.time() - start
 
         if result.returncode != 0:
+            print(f"ERROR: Blender exited {result.returncode} for {model_id}")
             print(result.stdout)
             print(result.stderr)
-            return jsonify({
-                "error": "Blender failed",
-                "stdout": result.stdout,
-                "stderr": result.stderr
-            }), 500
+            return jsonify({"error": "Blender failed", "model_id": model_id}), 500
 
         for _ in range(30):
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
@@ -290,10 +425,8 @@ def generate():
             time.sleep(0.1)
 
         if not os.path.exists(output_path):
-            return jsonify({
-                "error": "Output file not created",
-                "stdout": result.stdout
-            }), 500
+            print(f"ERROR: no output produced for {model_id}\n{result.stdout}")
+            return jsonify({"error": "Output file not created", "model_id": model_id}), 500
 
         if result.stdout:
             print(f"INFO: Blender stdout for {model_id}:\n{result.stdout}")
@@ -314,7 +447,8 @@ def generate():
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"ERROR: generation failed: {e}")
+        return jsonify({"error": "Generation failed"}), 500
 
     finally:
         if config_path:
@@ -331,11 +465,17 @@ def generate():
 
 
 @app.route("/models/<filename>", methods=["GET"])
+@require_service_token
 def get_model(filename):
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    if os.path.exists(filepath):
-        return send_file(filepath, mimetype="model/gltf-binary")
-    return jsonify({"error": "Model not found"}), 404
+    try:
+        _, _, filepath = _resolve_output_path(filename)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if not os.path.exists(filepath):
+        return jsonify({"error": "Model not found"}), 404
+
+    return send_file(filepath, mimetype="model/gltf-binary")
 
 
 if __name__ == "__main__":

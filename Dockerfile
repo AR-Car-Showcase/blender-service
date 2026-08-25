@@ -40,8 +40,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy service code
 COPY . .
 
-# Ensure generated directory exists
-RUN mkdir -p generated
+# Run as an unprivileged user. A path-traversal write in this service used to land
+# as root; even with the input now validated, the process has no reason to be root.
+RUN useradd --create-home --uid 10001 blender \
+    && mkdir -p /app/generated /home/blender/.oci \
+    && chown -R blender:blender /app /home/blender
+
+USER blender
+ENV HOME=/home/blender
 
 EXPOSE 5000
 
