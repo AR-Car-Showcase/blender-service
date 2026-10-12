@@ -5,6 +5,7 @@ import functools
 import hmac
 import re
 import subprocess
+import threading
 import json
 import os
 import uuid
@@ -38,6 +39,37 @@ GENERATE_TIMEOUT_SECONDS = int(os.environ.get("GENERATE_TIMEOUT_SECONDS", "120")
 # not. Fail closed at startup rather than silently accepting anonymous render jobs.
 BLENDER_SERVICE_TOKEN = os.environ.get("BLENDER_SERVICE_TOKEN", "").strip()
 MIN_TOKEN_LENGTH = 32
+
+# One Blender import of a 30-150 MB GLB costs a multiple of the file size in RAM, and
+# nothing here used to limit how many ran at once - a handful of concurrent requests
+# was enough for the kernel to start OOM-killing processes. Cap the renders and make
+# the overflow explicit instead of letting the VM fall over.
+MAX_CONCURRENT_RENDERS = max(1, int(os.environ.get("MAX_CONCURRENT_RENDERS", "1")))
+RENDER_WAIT_SECONDS = max(0, int(os.environ.get("RENDER_WAIT_SECONDS", "30")))
+SERVER_THREADS = max(2, int(os.environ.get("SERVER_THREADS", "8")))
+
+_render_slots = threading.BoundedSemaphore(MAX_CONCURRENT_RENDERS)
+_render_slots_held = threading.Lock()
+_active_renders = 0
+
+
+def _begin_render():
+    """Claim a render slot, or return False when the service is already saturated."""
+    global _active_renders
+    acquired = _render_slots.acquire(timeout=RENDER_WAIT_SECONDS) if RENDER_WAIT_SECONDS \
+        else _render_slots.acquire(blocking=False)
+    if not acquired:
+        return False
+    with _render_slots_held:
+        _active_renders += 1
+    return True
+
+
+def _end_render():
+    global _active_renders
+    with _render_slots_held:
+        _active_renders -= 1
+    _render_slots.release()
 
 CAR_MODEL_NAME = os.environ.get("CAR_MODEL_NAME", "car.glb")
 CAR_MODEL_PATH = os.path.join(BASE_MODELS_DIR, CAR_MODEL_NAME)
@@ -358,7 +390,10 @@ def health_details():
         "oci_models_prefix": OCI_MODELS_PREFIX,
         "oci_generated_prefix": OCI_GENERATED_PREFIX,
         "output_dir": OUTPUT_DIR,
-        "temp_dir": TEMP_DIR
+        "temp_dir": TEMP_DIR,
+        "max_concurrent_renders": MAX_CONCURRENT_RENDERS,
+        "active_renders": _active_renders,
+        "render_wait_seconds": RENDER_WAIT_SECONDS
     })
 
 
@@ -369,10 +404,20 @@ def generate():
     output_path = None
     config_path = None
 
+    config = request.json
+    if not config:
+        return jsonify({"error": "No config provided"}), 400
+
+    if not _begin_render():
+        print(f"WARN: render capacity reached ({MAX_CONCURRENT_RENDERS} in flight); rejecting request")
+        response = jsonify({
+            "error": "Generation capacity reached. Please retry shortly.",
+            "max_concurrent_renders": MAX_CONCURRENT_RENDERS,
+        })
+        response.headers["Retry-After"] = str(max(5, RENDER_WAIT_SECONDS))
+        return response, 503
+
     try:
-        config = request.json
-        if not config:
-            return jsonify({"error": "No config provided"}), 400
 
         requested_name = config.get("output_name") or f"car_{str(uuid.uuid4())[:8]}"
         try:
@@ -463,6 +508,8 @@ def generate():
             with suppress(FileNotFoundError):
                 os.remove(output_path)
 
+        _end_render()
+
 
 @app.route("/models/<filename>", methods=["GET"])
 @require_service_token
@@ -483,4 +530,13 @@ if __name__ == "__main__":
     print("INFO: Blender path:", BLENDER_PATH)
     print("INFO: Output directory:", OUTPUT_DIR)
     print("INFO: OCI object storage enabled:", OCI_OBJECT_STORAGE_ENABLED)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print(f"INFO: Max concurrent renders: {MAX_CONCURRENT_RENDERS}")
+
+    # Flask's development server is not meant to face real traffic. waitress is a
+    # pure-python WSGI server, so it needs no build tooling in the slim image.
+    try:
+        from waitress import serve
+        serve(app, host="0.0.0.0", port=5000, threads=SERVER_THREADS)
+    except ImportError:
+        print("WARN: waitress is not installed; falling back to the Flask dev server.")
+        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
